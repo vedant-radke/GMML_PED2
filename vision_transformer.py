@@ -166,3 +166,140 @@ class VisionTransformer(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def interpolate_pos_encoding(self, x, w, h):
+        npatch = x.shape[1] - 1
+        N = self.pos_embed.shape[1] - 1
+        if npatch == N and w == h:
+            return self.pos_embed
+        class_pos_embed = self.pos_embed[:, 0]
+        patch_pos_embed = self.pos_embed[:, 1:]
+        dim = x.shape[-1]
+        w0 = w // self.patch_embed.patch_size
+        h0 = h // self.patch_embed.patch_size
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        w0, h0 = w0 + 0.1, h0 + 0.1
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
+            scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
+            mode='bicubic',
+        )
+        assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
+    def prepare_tokens(self, x):
+        B, nc, w, h = x.shape
+        x = self.patch_embed(x)  # patch linear embedding
+
+        # add the [CLS] token to the embed patch tokens
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        # add positional encoding to each token
+        x = x + self.interpolate_pos_encoding(x, w, h)
+
+        return self.pos_drop(x)
+
+    def forward(self, x, recons_blocks=None):
+        x = self.prepare_tokens(x)
+        
+        # Store features from specified blocks for reconstruction
+        features = []
+        if recons_blocks:
+            blocks_to_capture = [int(b) for b in recons_blocks.split('-') if b]
+        else:
+            blocks_to_capture = []
+        
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i in blocks_to_capture:
+                features.append(x)
+        
+        x = self.norm(x)
+        
+        if self.headData:
+            x = self.head_data(x)
+        
+        if self.headClass:
+            x = self.head(x[:, 0])
+        
+        if features:
+            return x, features
+        return x
+
+    def get_last_selfattention(self, x):
+        x = self.prepare_tokens(x)
+        for i, blk in enumerate(self.blocks):
+            if i < len(self.blocks) - 1:
+                x = blk(x)
+            else:
+                # Return attention of the last block
+                return blk(x, return_attention=True)[1]
+
+    def get_intermediate_layers(self, x, n=1):
+        x = self.prepare_tokens(x)
+        # Return the output tokens from the last n blocks
+        output = []
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i >= len(self.blocks) - n:
+                output.append(self.norm(x))
+        return output
+
+
+class RECHead(nn.Module):
+    """Reconstruction Head for Vision Transformer"""
+    def __init__(self, in_dim, out_dim=3, patch_size=16, img_size=224):
+        super().__init__()
+        self.in_dim = in_dim
+        self.patch_size = patch_size
+        self.img_size = img_size
+        
+        # Calculate the number of patches
+        self.num_patches = (img_size // patch_size) ** 2
+        
+        # Reconstruction head
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.GELU(),
+            nn.Linear(in_dim, patch_size * patch_size * out_dim)
+        )
+        
+    def forward(self, x):
+        B, N, C = x.shape
+        if N > self.num_patches + 1:  # If there's a class token
+            x = x[:, 1:]  # Remove the class token
+        
+        # Apply the reconstruction head
+        x = self.head(x)
+        
+        # Reshape to image dimensions
+        x = x.reshape(B, int(math.sqrt(N-1)), int(math.sqrt(N-1)), 
+                      self.patch_size, self.patch_size, -1)
+        x = x.permute(0, 5, 1, 3, 2, 4)
+        x = x.reshape(B, -1, self.img_size, self.img_size)
+        
+        return x
+
+
+def vit_tiny(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size, embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
+        qkv_bias=True, **kwargs)
+    return model
+
+
+def vit_small(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4,
+        qkv_bias=True, **kwargs)
+    return model
+
+
+def vit_base(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4,
+        qkv_bias=True, **kwargs)
+    return model
