@@ -21,7 +21,7 @@ from numpy.random import randint
 # Import the modified dataset utilities
 from datasets import load_dataset
 from PED2 import Ped2Dataset
-from datasets.datasets_utils import DataAugmentationSiT
+from datasets.datasets_utils import DataAugmentationSiT, GMML_replace_list
 from datasets.ped2_data_augmentation import DataAugmentationPed2
 
 import utils
@@ -187,8 +187,8 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
         masks_crops = [im.cuda(non_blocking=True) for im in masks_crops]
         
         if args.drop_replace > 0:
-            corrupted_crops, masks_crops = datasets_utils.GMML_replace_list(clean_crops, corrupted_crops, masks_crops, drop_type=args.drop_type,
-                                                                            max_replace=args.drop_replace, align=args.drop_align)
+            corrupted_crops, masks_crops = GMML_replace_list(clean_crops, corrupted_crops, masks_crops, drop_type=args.drop_type,
+                                                           max_replace=args.drop_replace, align=args.drop_align)
         
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             s_recons_g, s_recons_l = SiT_model(corrupted_crops, recons_blocks=args.recons_blocks)
@@ -247,7 +247,6 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
 
 
 class FullpiplineSiT(nn.Module):
-
     def __init__(self, backbone, head_recons):
         super(FullpiplineSiT, self).__init__()
 
@@ -256,14 +255,13 @@ class FullpiplineSiT(nn.Module):
         self.head_recons = head_recons
 
     def forward(self, x, global_crops=2, recons_blocks='6-8-10-12'):  
-        
         # global output
-        output_recons_global = self.head_recons( self.backbone(torch.cat(x[0:global_crops]), recons_blocks=recons_blocks) )
+        output_recons_global = self.head_recons(self.backbone(torch.cat(x[0:global_crops]), recons_blocks=recons_blocks))
         
         # local_output
         output_recons_local = None  
         if (len(x) > global_crops):
-            output_recons_local = self.head_recons( self.backbone(torch.cat(x[global_crops:]), recons_blocks=recons_blocks) )
+            output_recons_local = self.head_recons(self.backbone(torch.cat(x[global_crops:]), recons_blocks=recons_blocks))
         
         return output_recons_global, output_recons_local
 
