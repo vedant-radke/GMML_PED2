@@ -268,6 +268,12 @@ class RECHead(nn.Module):
         )
         
     def forward(self, x):
+        print(f"type(x): {type(x)}")  # Check type of x
+        print(f"x: {x}")  # Print value of x (ensure it's a tensor)
+
+        output = self.backbone(torch.cat(x[0:global_crops]), recons_blocks=recons_blocks)
+        print(f"type(output): {type(output)}")  # Check if self.backbone returns a tensor or tuple
+
         B, N, C = x.shape
         if N > self.num_patches + 1:  # If there's a class token
             x = x[:, 1:]  # Remove the class token

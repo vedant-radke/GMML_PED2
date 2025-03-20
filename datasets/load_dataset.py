@@ -53,8 +53,11 @@ def build_dataset(args, is_train, trnsfrm=None, training_mode='finetune'):
                                    train=is_train, transform=trnsfrm, download=True)
         nb_classes = 10
     elif args.data_set == 'PED2':
-        dataset = PED2Dataset(os.path.join(args.data_location, 'PED2'), 
-                              is_train=is_train, transform=trnsfrm)
+        # dataset = PED2Dataset(os.path.join(args.data_location, 'PED2'), 
+        #                       is_train=is_train, transform=trnsfrm)
+        dataset = PED2Dataset(args.data_location, 
+                      is_train=is_train, transform=trnsfrm)
+
         nb_classes = 1  # For autoencoder/reconstruction tasks, class labels aren't needed
     else:
         raise ValueError(f"Dataset {args.data_set} not supported")
