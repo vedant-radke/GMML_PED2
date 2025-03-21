@@ -271,16 +271,33 @@ class RECHead(nn.Module):
         # Check if x is a tensor or tuple (x, features)
         if isinstance(x, tuple):
             x = x[0]  # Use the final output from the transformer
+        
+        # Check tensor dimensions and reshape if necessary
+        if len(x.shape) == 2:
+            # If we have a 2D tensor [B, C], reshape to [B, 1, C]
+            B, C = x.shape
+            x = x.unsqueeze(1)
+            N = 1
+        else:
+            # Regular case with [B, N, C]
+            B, N, C = x.shape
             
-        B, N, C = x.shape
         if N > self.num_patches + 1:  # If there's a class token
             x = x[:, 1:]  # Remove the class token
+        
+        # For the case where we only have the CLS token or a single embedding
+        if N == 1:
+            # Expand the single embedding to match the required number of patches
+            x = x.expand(B, self.num_patches, C)
         
         # Apply the reconstruction head
         x = self.head(x)
         
+        # Calculate grid dimensions based on the number of patches (after removing CLS token if present)
+        grid_size = int(math.sqrt(x.shape[1]))
+        
         # Reshape to image dimensions
-        x = x.reshape(B, int(math.sqrt(N-1)), int(math.sqrt(N-1)), 
+        x = x.reshape(B, grid_size, grid_size, 
                       self.patch_size, self.patch_size, -1)
         x = x.permute(0, 5, 1, 3, 2, 4)
         x = x.reshape(B, -1, self.img_size, self.img_size)
