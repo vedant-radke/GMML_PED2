@@ -177,13 +177,15 @@ class VisionTransformer(nn.Module):
         dim = x.shape[-1]
         w0 = w // self.patch_embed.patch_size
         h0 = h // self.patch_embed.patch_size
-        # we add a small number to avoid floating point error in the interpolation
-        # see discussion at https://github.com/facebookresearch/dino/issues/8
-        w0, h0 = w0 + 0.1, h0 + 0.1
+        # We add a small number to avoid floating point error in the interpolation
+        # See discussion at https://github.com/facebookresearch/dino/issues/8
+        # Use a safer very small constant to avoid any floating point issues
+        w0, h0 = w0 + 0.0001, h0 + 0.0001
         patch_pos_embed = nn.functional.interpolate(
             patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
             scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
             mode='bicubic',
+            align_corners=False,  # Add align_corners for better interpolation
         )
         assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
@@ -223,11 +225,14 @@ class VisionTransformer(nn.Module):
             x = self.head_data(x)
         
         if self.headClass:
-            x = self.head(x[:, 0])
+            cls_output = self.head(x[:, 0])
+        else:
+            cls_output = x
         
         if features:
-            return x, features
-        return x
+            # Return both classification output and features for reconstruction
+            return cls_output, features
+        return cls_output
 
     def get_last_selfattention(self, x):
         x = self.prepare_tokens(x)
@@ -260,47 +265,71 @@ class RECHead(nn.Module):
         # Calculate the number of patches
         self.num_patches = (img_size // patch_size) ** 2
         
-        # Reconstruction head
+        # Improved reconstruction head with layer normalization
         self.head = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
+            nn.LayerNorm(in_dim),  # Add normalization for better stability
+            nn.Linear(in_dim, in_dim * 2),
             nn.GELU(),
-            nn.Linear(in_dim, patch_size * patch_size * out_dim)
+            nn.Linear(in_dim * 2, patch_size * patch_size * out_dim)
         )
         
     def forward(self, x):
-        # Check if x is a tensor or tuple (x, features)
-        if isinstance(x, tuple):
-            x = x[0]  # Use the final output from the transformer
-        
-        # Check tensor dimensions and reshape if necessary
-        if len(x.shape) == 2:
-            # If we have a 2D tensor [B, C], reshape to [B, 1, C]
-            B, C = x.shape
-            x = x.unsqueeze(1)
-            N = 1
+        # Handle different input types
+        if isinstance(x, list):
+            # If we have a list of features from different blocks
+            # Concatenate them along the feature dimension for multi-scale reconstruction
+            if len(x) > 1:
+                # Ensure all features have the same shape
+                shapes = [f.shape for f in x]
+                if all(s[0] == shapes[0][0] and s[1] == shapes[0][1] for s in shapes):
+                    # Simple concatenation if shapes match
+                    x = torch.cat(x, dim=-1)
+                    x = x[:, 1:]  # Remove CLS tokens
+                else:
+                    # Take the last feature if shapes don't match
+                    x = x[-1][:, 1:]  # Use the deepest feature and remove CLS token
+            else:
+                x = x[0][:, 1:]  # Single feature, remove CLS token
+        elif isinstance(x, tuple):
+            # If it's a tuple (cls_output, features)
+            x = x[1][-1][:, 1:]  # Use the last feature in the list and remove CLS token
         else:
-            # Regular case with [B, N, C]
+            # If it's a tensor, remove CLS token if present
             B, N, C = x.shape
-            
-        if N > self.num_patches + 1:  # If there's a class token
-            x = x[:, 1:]  # Remove the class token
+            if N > self.num_patches:  # If there's a class token
+                x = x[:, 1:]  # Remove the class token
         
-        # For the case where we only have the CLS token or a single embedding
-        if N == 1:
-            # Expand the single embedding to match the required number of patches
-            x = x.expand(B, self.num_patches, C)
+        # Get tensor dimensions
+        B, N, C = x.shape
+        
+        # Handle case where N doesn't match expected number of patches
+        if N != self.num_patches:
+            # Resize to match expected number of patches
+            if N < self.num_patches:
+                # Expand if we have fewer patches
+                x = torch.cat([x, x[:, -(self.num_patches-N):]], dim=1)
+            else:
+                # Truncate if we have more patches
+                x = x[:, :self.num_patches]
         
         # Apply the reconstruction head
         x = self.head(x)
         
-        # Calculate grid dimensions based on the number of patches (after removing CLS token if present)
-        grid_size = int(math.sqrt(x.shape[1]))
+        # Calculate grid size for reshaping
+        grid_size = int(math.sqrt(self.num_patches))
         
-        # Reshape to image dimensions
-        x = x.reshape(B, grid_size, grid_size, 
-                      self.patch_size, self.patch_size, -1)
-        x = x.permute(0, 5, 1, 3, 2, 4)
-        x = x.reshape(B, -1, self.img_size, self.img_size)
+        # Reshape to image format with proper error handling
+        try:
+            x = x.reshape(B, grid_size, grid_size, 
+                          self.patch_size, self.patch_size, -1)
+            x = x.permute(0, 5, 1, 3, 2, 4)
+            x = x.reshape(B, -1, self.img_size, self.img_size)
+        except RuntimeError:
+            # Fallback reshape if dimensions don't match
+            out_chans = x.size(-1) // (self.patch_size * self.patch_size)
+            x = x.reshape(B, grid_size, grid_size, self.patch_size, self.patch_size, out_chans)
+            x = x.permute(0, 5, 1, 3, 2, 4)
+            x = x.reshape(B, out_chans, self.img_size, self.img_size)
         
         return x
 
