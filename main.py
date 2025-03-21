@@ -191,7 +191,7 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
         
         if args.drop_replace > 0:
             corrupted_crops, masks_crops = GMML_replace_list(clean_crops, corrupted_crops, masks_crops, drop_type=args.drop_type,
-                                                           max_replace=args.drop_replace, align=args.drop_align)
+                                                          max_replace=args.drop_replace, align=args.drop_align)
         
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             s_recons_g, s_recons_l = SiT_model(corrupted_crops, args.recons_blocks)
@@ -210,7 +210,7 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
                 #validating: check the reconstructed images
                 print_out = save_recon + '/epoch_' + str(epoch).zfill(5)  + '.jpg' 
                 imagesToPrint = torch.cat([clean_crops[0][0: min(15, bz)].cpu(),  corrupted_crops[0][0: min(15, bz)].cpu(),
-                                       s_recons_g[0: min(15, bz)].cpu(), masks_crops[0][0: min(15, bz)].cpu()], dim=0)
+                                      s_recons_g[0: min(15, bz)].cpu(), masks_crops[0][0: min(15, bz)].cpu()], dim=0)
                 torchvision.utils.save_image(imagesToPrint, print_out, nrow=min(15, bz), normalize=True, value_range=(-1, 1))
                         
         if not math.isfinite(loss.item()):
@@ -233,15 +233,12 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
-
         # logging
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        
-        
         
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -268,4 +265,15 @@ class FullpiplineSiT(nn.Module):
         # Process local crops if available
         output_recons_local = None  
         if len(x) > global_crops:
-            local_crops_tensor = torch.cat(x[
+            local_crops_tensor = torch.cat(x[global_crops:])
+            backbone_output_local = self.backbone(local_crops_tensor, recons_blocks=recons_blocks)
+            output_recons_local = self.head_recons(backbone_output_local)
+        
+        return output_recons_global, output_recons_local
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser('SiTv2', parents=[get_args_parser()])
+    args = parser.parse_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    train_SiTv2(args)
