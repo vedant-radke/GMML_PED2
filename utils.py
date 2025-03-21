@@ -24,18 +24,18 @@ import math
 import random
 import datetime
 import subprocess
+import argparse
+import warnings
 from collections import defaultdict, deque
 
 import numpy as np
-from numpy.random import randint
 import io
 import torch
 from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps, Image
 from torchvision import transforms as tf
-#from torch_scatter import scatter_mean
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 def _load_checkpoint_for_ema(model_ema, checkpoint):
     """
@@ -178,6 +178,7 @@ def fix_random_seeds(seed=31):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
 
 class SmoothedValue(object):
@@ -223,15 +224,15 @@ class SmoothedValue(object):
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        return self.total / self.count if self.count > 0 else 0.0
 
     @property
     def max(self):
-        return max(self.deque)
+        return max(self.deque) if len(self.deque) > 0 else 0.0
 
     @property
     def value(self):
-        return self.deque[-1]
+        return self.deque[-1] if len(self.deque) > 0 else 0.0
 
     def __str__(self):
         return self.fmt.format(
@@ -460,9 +461,12 @@ def init_distributed_mode(args):
 
 
 def barrier():
-    t = torch.randn((), device='cuda')
-    dist.all_reduce(t)
-    torch.cuda.synchronize()
+    """Create a barrier to synchronize all processes."""
+    if is_dist_avail_and_initialized():
+        t = torch.tensor(0, device='cuda')
+        dist.all_reduce(t)
+        torch.cuda.synchronize()
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -470,7 +474,7 @@ def accuracy(output, target, topk=(1,)):
     batch_size = target.size(0)
     _, pred = output.topk(maxk, 1, True, True)
     pred = pred.t()
-    correct = pred.eq(target.reshape(1, -1).expand_as(pred))
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
     return [correct[:k].reshape(-1).float().sum(0) * 100. / batch_size for k in topk]
 
 
@@ -511,7 +515,7 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
-    # type: (Tensor, float, float, float, float) -> Tensor
+    # type: (torch.Tensor, float, float, float, float) -> torch.Tensor
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
 
@@ -585,10 +589,10 @@ def scatter_sum(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
     else:
         return out.scatter_add_(dim, index, src)
 
+
 def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
                  out: Optional[torch.Tensor] = None,
                  dim_size: Optional[int] = None) -> torch.Tensor:
-
     out = scatter_sum(src, index, dim, out, dim_size)
     dim_size = out.size(dim)
 
@@ -600,14 +604,13 @@ def scatter_mean(src: torch.Tensor, index: torch.Tensor, dim: int = -1,
 
     ones = torch.ones(index.size(), dtype=src.dtype, device=src.device)
     count = scatter_sum(ones, index, index_dim, None, dim_size)
-    count[count < 1] = 1
+    count = count.clamp(min=1)
     count = broadcast(count, out, dim)
     if out.is_floating_point():
-        out.true_divide_(count)
+        out.div_(count)
     else:
-        out.floor_divide_(count)
+        out.div_(count, rounding_mode='trunc')
     return out
-
 
 
 class MultiCropWrapper(nn.Module):
@@ -622,7 +625,10 @@ class MultiCropWrapper(nn.Module):
     def __init__(self, backbone, head_datatokens, head_barlowtokens, head_recons):
         super(MultiCropWrapper, self).__init__()
         # disable layers dedicated to ImageNet labels classification
-        backbone.fc, backbone.head = nn.Identity(), nn.Identity()
+        if hasattr(backbone, 'fc'):
+            backbone.fc = nn.Identity()
+        if hasattr(backbone, 'head'):
+            backbone.head = nn.Identity()
         self.backbone = backbone
         self.head_datatokens = head_datatokens
         self.head_barlowtokens = head_barlowtokens
@@ -635,22 +641,19 @@ class MultiCropWrapper(nn.Module):
         idx_crops = torch.cumsum(torch.unique_consecutive(
             torch.tensor([inp.shape[-1] for inp in x]),
             return_counts=True)[1], 0)
-        start_idx, output_data = 0, []
-        
+        start_idx = 0
+        output_data = []
         output_barlow = []
-        output_recons= []
+        output_recons = []
+        
         for end_idx in idx_crops:
-            
             _out_class, _out_data, _rec_data = self.backbone(torch.cat(x[start_idx: end_idx]))
             output_data.append(self.head_datatokens(_out_data))
             output_recons.append(self.head_recons(_out_data))
             output_barlow.append(self.head_barlowtokens(_out_class))
-            
-
             start_idx = end_idx
         
         return output_data, output_barlow, output_recons
-
 
 
 def get_params_groups(model):
@@ -677,7 +680,7 @@ def has_batchnorms(model):
 
 class PCA():
     """
-    Class to  compute and apply PCA.
+    Class to compute and apply PCA.
     """
     def __init__(self, dim=256, whit=0.5):
         self.dim = dim
@@ -720,134 +723,14 @@ class PCA():
         # input is from torch and is on GPU
         if x.is_cuda:
             if self.mean is not None:
-                x -= torch.cuda.FloatTensor(self.mean)
-            return torch.mm(torch.cuda.FloatTensor(self.dvt), x.transpose(0, 1)).transpose(0, 1)
+                x -= torch.tensor(self.mean, device=x.device, dtype=torch.float32)
+            return torch.mm(torch.tensor(self.dvt, device=x.device, dtype=torch.float32), x.transpose(0, 1)).transpose(0, 1)
 
         # input if from torch, on CPU
         if self.mean is not None:
-            x -= torch.FloatTensor(self.mean)
-        return torch.mm(torch.FloatTensor(self.dvt), x.transpose(0, 1)).transpose(0, 1)
+            x -= torch.tensor(self.mean, dtype=torch.float32)
+        return torch.mm(torch.tensor(self.dvt, dtype=torch.float32), x.transpose(0, 1)).transpose(0, 1)
 
 
 def compute_ap(ranks, nres):
     """
-    Computes average precision for given ranked indexes.
-    Arguments
-    ---------
-    ranks : zerro-based ranks of positive images
-    nres  : number of positive images
-    Returns
-    -------
-    ap    : average precision
-    """
-
-    # number of images ranked by the system
-    nimgranks = len(ranks)
-
-    # accumulate trapezoids in PR-plot
-    ap = 0
-
-    recall_step = 1. / nres
-
-    for j in np.arange(nimgranks):
-        rank = ranks[j]
-
-        if rank == 0:
-            precision_0 = 1.
-        else:
-            precision_0 = float(j) / rank
-
-        precision_1 = float(j + 1) / (rank + 1)
-
-        ap += (precision_0 + precision_1) * recall_step / 2.
-
-    return ap
-
-
-def compute_map(ranks, gnd, kappas=[]):
-    """
-    Computes the mAP for a given set of returned results.
-         Usage:
-           map = compute_map (ranks, gnd)
-                 computes mean average precsion (map) only
-           map, aps, pr, prs = compute_map (ranks, gnd, kappas)
-                 computes mean average precision (map), average precision (aps) for each query
-                 computes mean precision at kappas (pr), precision at kappas (prs) for each query
-         Notes:
-         1) ranks starts from 0, ranks.shape = db_size X #queries
-         2) The junk results (e.g., the query itself) should be declared in the gnd stuct array
-         3) If there are no positive images for some query, that query is excluded from the evaluation
-    """
-
-    map = 0.
-    nq = len(gnd) # number of queries
-    aps = np.zeros(nq)
-    pr = np.zeros(len(kappas))
-    prs = np.zeros((nq, len(kappas)))
-    nempty = 0
-
-    for i in np.arange(nq):
-        qgnd = np.array(gnd[i]['ok'])
-
-        # no positive images, skip from the average
-        if qgnd.shape[0] == 0:
-            aps[i] = float('nan')
-            prs[i, :] = float('nan')
-            nempty += 1
-            continue
-
-        try:
-            qgndj = np.array(gnd[i]['junk'])
-        except:
-            qgndj = np.empty(0)
-
-        # sorted positions of positive and junk images (0 based)
-        pos  = np.arange(ranks.shape[0])[np.in1d(ranks[:,i], qgnd)]
-        junk = np.arange(ranks.shape[0])[np.in1d(ranks[:,i], qgndj)]
-
-        k = 0;
-        ij = 0;
-        if len(junk):
-            # decrease positions of positives based on the number of
-            # junk images appearing before them
-            ip = 0
-            while (ip < len(pos)):
-                while (ij < len(junk) and pos[ip] > junk[ij]):
-                    k += 1
-                    ij += 1
-                pos[ip] = pos[ip] - k
-                ip += 1
-
-        # compute ap
-        ap = compute_ap(pos, len(qgnd))
-        map = map + ap
-        aps[i] = ap
-
-        # compute precision @ k
-        pos += 1 # get it to 1-based
-        for j in np.arange(len(kappas)):
-            kq = min(max(pos), kappas[j]); 
-            prs[i, j] = (pos <= kq).sum() / kq
-        pr = pr + prs[i, :]
-
-    map = map / (nq - nempty)
-    pr = pr / (nq - nempty)
-
-    return map, aps, pr, prs
-
-
-def multi_scale(samples, model):
-    v = None
-    for s in [1, 1/2**(1/2), 1/2]:  # we use 3 different scales
-        if s == 1:
-            inp = samples.clone()
-        else:
-            inp = nn.functional.interpolate(samples, scale_factor=s, mode='bilinear', align_corners=False)
-        feats = model(inp).clone()
-        if v is None:
-            v = feats
-        else:
-            v += feats
-    v /= 3
-    v /= v.norm()
-    return v
