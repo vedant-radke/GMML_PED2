@@ -143,9 +143,9 @@ def train_SiTv2(args):
     embed_dim = SiT_model.embed_dim
     
     # Create reconstruction head with the correct img_size
-    rec_head = RECHead(embed_dim, patch_size=SiT_model.patch_embed.patch_size, img_size=args.img_size)
+    rec_head = RECHead(embed_dim, patch_size=SiT_model.patch_embed.patch_size[0], img_size=args.img_size)
     
-    SiT_model = FullpiplineSiT(SiT_model, rec_head)
+    SiT_model = FullPipelineSiT(SiT_model, rec_head)
     SiT_model = SiT_model.cuda()
         
     SiT_model = nn.parallel.DistributedDataParallel(SiT_model, device_ids=[args.gpu])
@@ -156,9 +156,11 @@ def train_SiTv2(args):
     params_groups = utils.get_params_groups(SiT_model)
     optimizer = torch.optim.AdamW(
         params_groups,
+        lr=args.lr,  # Set initial learning rate
         betas=(0.9, 0.999),
-        eps=1e-8
-    )  # to use with ViTs
+        eps=1e-8,
+        weight_decay=args.weight_decay  # Set initial weight decay
+    )
 
     fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
 
@@ -259,6 +261,9 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
     bz = args.batch_size
     plot_ = True
     
+    # Set model to training mode
+    SiT_model.train()
+    
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, ((clean_crops, corrupted_crops, masks_crops), _) in enumerate(metric_logger.log_every(data_loader, 100, header)):
@@ -321,7 +326,7 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
                 
                 loss += r_
                 
-            if plot_==True and utils.is_main_process():# and args.saveckp_freq and epoch % args.saveckp_freq == 0:
+            if plot_ and utils.is_main_process() and epoch % args.saveckp_freq == 0:
                 plot_ = False
                 #validating: check the reconstructed images
                 print_out = save_recon + '/epoch_' + str(epoch).zfill(5)  + '.jpg' 
@@ -484,9 +489,9 @@ def plot_loss_curves(train_losses, val_losses, output_dir):
         print(f"Error plotting loss curves: {e}")
 
 
-class FullpiplineSiT(nn.Module):
+class FullPipelineSiT(nn.Module):
     def __init__(self, backbone, head_recons):
-        super(FullpiplineSiT, self).__init__()
+        super(FullPipelineSiT, self).__init__()
 
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
         self.backbone = backbone
@@ -505,13 +510,20 @@ class FullpiplineSiT(nn.Module):
         
         # Process global crops
         global_crops_tensor = torch.cat(x[0:global_crops])
+        # Modified to handle the tuple output from backbone
         backbone_output = self.backbone(global_crops_tensor, recons_blocks=recons_blocks)
-        output_recons_global = self.head_recons(backbone_output)
+        
+        # Unpack backbone output if it's a tuple
+        if isinstance(backbone_output, tuple):
+            features = backbone_output[1]  # Get features for reconstruction
+            output_recons_global = self.head_recons(features)
+        else:
+            output_recons_global = self.head_recons(backbone_output)
         
         # Additional refinement for better reconstruction
         if hasattr(self, 'refine'):
             # Downsample first to match original resolution
-            output_recons_global = F.interpolate(output_recons_global, scale_factor=0.5, mode='bilinear')
+            output_recons_global = F.interpolate(output_recons_global, scale_factor=0.5, mode='bilinear', align_corners=False)
             # Apply refinement
             output_recons_global = self.refine(output_recons_global)
             # Ensure values are in range [-1, 1]
@@ -522,11 +534,17 @@ class FullpiplineSiT(nn.Module):
         if len(x) > global_crops:
             local_crops_tensor = torch.cat(x[global_crops:])
             backbone_output_local = self.backbone(local_crops_tensor, recons_blocks=recons_blocks)
-            output_recons_local = self.head_recons(backbone_output_local)
+            
+            # Unpack backbone output if it's a tuple
+            if isinstance(backbone_output_local, tuple):
+                features_local = backbone_output_local[1]
+                output_recons_local = self.head_recons(features_local)
+            else:
+                output_recons_local = self.head_recons(backbone_output_local)
             
             # Apply same refinement to local crops
             if hasattr(self, 'refine'):
-                output_recons_local = F.interpolate(output_recons_local, scale_factor=0.5, mode='bilinear')
+                output_recons_local = F.interpolate(output_recons_local, scale_factor=0.5, mode='bilinear', align_corners=False)
                 output_recons_local = self.refine(output_recons_local)
                 output_recons_local = torch.clamp(output_recons_local, -1, 1)
         
