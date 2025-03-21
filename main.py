@@ -110,7 +110,10 @@ def train_SiTv2(args):
     n_params = sum(p.numel() for p in SiT_model.parameters() if p.requires_grad)
     embed_dim = SiT_model.embed_dim
     
-    SiT_model = FullpiplineSiT(SiT_model, RECHead(embed_dim))
+    # Create reconstruction head with the correct img_size
+    rec_head = RECHead(embed_dim, patch_size=SiT_model.patch_embed.patch_size, img_size=args.img_size)
+    
+    SiT_model = FullpiplineSiT(SiT_model, rec_head)
     SiT_model = SiT_model.cuda()
         
     SiT_model = nn.parallel.DistributedDataParallel(SiT_model, device_ids=[args.gpu])
@@ -191,7 +194,7 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
                                                            max_replace=args.drop_replace, align=args.drop_align)
         
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            s_recons_g, s_recons_l = SiT_model(corrupted_crops, recons_blocks=args.recons_blocks)
+            s_recons_g, s_recons_l = SiT_model(corrupted_crops, args.recons_blocks)
             
             #-------------------------------------------------
             recloss = F.l1_loss(s_recons_g, torch.cat(clean_crops[0:2]), reduction='none')
@@ -254,20 +257,15 @@ class FullpiplineSiT(nn.Module):
         self.backbone = backbone
         self.head_recons = head_recons
 
-    def forward(self, x, global_crops=2, recons_blocks='6-8-10-12'):  
-        # global output
-        output_recons_global = self.head_recons(self.backbone(torch.cat(x[0:global_crops]), recons_blocks=recons_blocks))
+    def forward(self, x, recons_blocks='6-8-10-12'):  
+        global_crops = min(2, len(x))  # Default to 2 global crops or less if not enough provided
         
-        # local_output
+        # Process global crops
+        global_crops_tensor = torch.cat(x[0:global_crops])
+        backbone_output = self.backbone(global_crops_tensor, recons_blocks=recons_blocks)
+        output_recons_global = self.head_recons(backbone_output)
+        
+        # Process local crops if available
         output_recons_local = None  
-        if (len(x) > global_crops):
-            output_recons_local = self.head_recons(self.backbone(torch.cat(x[global_crops:]), recons_blocks=recons_blocks))
-        
-        return output_recons_global, output_recons_local
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('SiTv2', parents=[get_args_parser()])
-    args = parser.parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_SiTv2(args)
+        if len(x) > global_crops:
+            local_crops_tensor = torch.cat(x[
