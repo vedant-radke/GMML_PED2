@@ -133,10 +133,10 @@ def train_SiTv2(args):
 
     # Resume Training if exist
     to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore, SiT_model=SiT_model,
-        optimizer=optimizer, fp16_scaler=fp16_scaler)
+    # utils.restart_from_checkpoint(
+    #     os.path.join(args.output_dir, "checkpoint.pth"),
+    #     run_variables=to_restore, SiT_model=SiT_model,
+    #     optimizer=optimizer, fp16_scaler=fp16_scaler)
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
