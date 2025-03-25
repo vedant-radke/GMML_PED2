@@ -74,6 +74,7 @@ def get_args_parser():
     
     # Misc
     parser.add_argument('--output_dir', default="checkpoints/PED2", type=str, help='Path to save logs and checkpoints.')
+    parser.add_argument('--checkpoint_path', default=None, type=str, help='Path to resume training checkpoint.')
     parser.add_argument('--saveckp_freq', default=10, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
@@ -90,7 +91,10 @@ def train_SiTv2(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
-    args.epochs += 1
+
+    # Increment epochs by 1 to match the range 20, 202, 20
+    start_epoch = 0
+    total_epochs = 202
 
     # Preparing Dataset
     if args.data_set == 'PED2':
@@ -126,42 +130,52 @@ def train_SiTv2(args):
 
     fp16_scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
 
+    # Handle checkpoint resuming
+    if args.checkpoint_path and os.path.exists(args.checkpoint_path):
+        checkpoint = torch.load(args.checkpoint_path, map_location='cuda')
+        start_epoch = checkpoint['epoch']
+        SiT_model.load_state_dict(checkpoint['SiT_model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        
+        if fp16_scaler is not None and 'fp16_scaler' in checkpoint:
+            fp16_scaler.load_state_dict(checkpoint['fp16_scaler'])
+        
+        print(f"==> Resuming training from epoch {start_epoch}")
+    
     # Initialize schedulers 
     lr_schedule = utils.cosine_scheduler(args.lr * (args.batch_size * utils.get_world_size()) / 256.,  
-        args.min_lr, args.epochs, len(data_loader), warmup_epochs=args.warmup_epochs)
-    wd_schedule = utils.cosine_scheduler(args.weight_decay, args.weight_decay_end, args.epochs, len(data_loader))
-
-    # Resume Training if exist
-    to_restore = {"epoch": 0}
-    # utils.restart_from_checkpoint(
-    #     os.path.join(args.output_dir, "checkpoint.pth"),
-    #     run_variables=to_restore, SiT_model=SiT_model,
-    #     optimizer=optimizer, fp16_scaler=fp16_scaler)
-    start_epoch = to_restore["epoch"]
+        args.min_lr, total_epochs, len(data_loader), warmup_epochs=args.warmup_epochs)
+    wd_schedule = utils.cosine_scheduler(args.weight_decay, args.weight_decay_end, total_epochs, len(data_loader))
 
     start_time = time.time()
     print(f"==> Start training from epoch {start_epoch}")
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, total_epochs):
         data_loader.sampler.set_epoch(epoch)
 
-        # Train an epoch
-        train_stats = train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
-            epoch, fp16_scaler, args)
+        # Skip epochs not in our desired ranges: 0-20, 20-202
+        if (epoch < 20 or (epoch >= 20 and epoch < 202)):
+            # Train an epoch
+            train_stats = train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
+                epoch, fp16_scaler, args)
 
-        save_dict = {'SiT_model': SiT_model.state_dict(), 'optimizer': optimizer.state_dict(),
-            'epoch': epoch + 1, 'args': args}
-        
-        if fp16_scaler is not None:
-            save_dict['fp16_scaler'] = fp16_scaler.state_dict()
+            save_dict = {'SiT_model': SiT_model.state_dict(), 'optimizer': optimizer.state_dict(),
+                'epoch': epoch + 1, 'args': args}
             
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
-        if args.saveckp_freq and epoch % args.saveckp_freq == 0:
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
-        if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            if fp16_scaler is not None:
+                save_dict['fp16_scaler'] = fp16_scaler.state_dict()
                 
+            # Always save the latest checkpoint
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
+            
+            # Additionally save checkpoints at specified frequency
+            if args.saveckp_freq and epoch % args.saveckp_freq == 0:
+                utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
+            
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
+            if utils.is_main_process():
+                with (Path(args.output_dir) / "log.txt").open("a") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+            
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
