@@ -59,7 +59,7 @@ def get_args_parser():
     parser.add_argument('--weight_decay', type=float, default=0.04, help="weight decay")
     parser.add_argument('--weight_decay_end', type=float, default=0.4, help="Final value of the weight decay.")
     
-    parser.add_argument("--lr", default=0.0005, type=float, help="Learning rate.")
+    parser.add_argument("--lr", default=0.005, type=float, help="Learning rate.")
     parser.add_argument('--min_lr', type=float, default=1e-6, help="Target LR at the end of optimization.")
     
     # Training/Optimization parameters
@@ -142,10 +142,11 @@ def train_SiTv2(args):
         
         print(f"==> Resuming training from epoch {start_epoch}")
     
-    # Initialize schedulers 
-    lr_schedule = utils.cosine_scheduler(args.lr * (args.batch_size * utils.get_world_size()) / 256.,  
-        args.min_lr, total_epochs, len(data_loader), warmup_epochs=args.warmup_epochs)
-    wd_schedule = utils.cosine_scheduler(args.weight_decay, args.weight_decay_end, total_epochs, len(data_loader))
+    # COMMENTED OUT ADAPTIVE LEARNING RATE
+    # Instead, use a constant learning rate
+    # lr_schedule = utils.cosine_scheduler(args.lr * (args.batch_size * utils.get_world_size()) / 256.,  
+    #     args.min_lr, total_epochs, len(data_loader), warmup_epochs=args.warmup_epochs)
+    # wd_schedule = utils.cosine_scheduler(args.weight_decay, args.weight_decay_end, total_epochs, len(data_loader))
 
     start_time = time.time()
     print(f"==> Start training from epoch {start_epoch}")
@@ -155,7 +156,7 @@ def train_SiTv2(args):
         # Skip epochs not in our desired ranges: 0-20, 20-202
         if (epoch < 20 or (epoch >= 20 and epoch < 202)):
             # Train an epoch
-            train_stats = train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
+            train_stats = train_one_epoch(SiT_model, data_loader, optimizer, 
                 epoch, fp16_scaler, args)
 
             save_dict = {'SiT_model': SiT_model.state_dict(), 'optimizer': optimizer.state_dict(),
@@ -180,8 +181,8 @@ def train_SiTv2(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
-
-def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule, epoch, fp16_scaler, args):
+# Modify train_one_epoch to remove adaptive learning rate
+def train_one_epoch(SiT_model, data_loader, optimizer, epoch, fp16_scaler, args):
     
     save_recon = os.path.join(args.output_dir, 'reconstruction_samples')
     Path(save_recon).mkdir(parents=True, exist_ok=True)
@@ -191,13 +192,9 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, ((clean_crops, corrupted_crops, masks_crops), _) in enumerate(metric_logger.log_every(data_loader, 100, header)):
-        # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
-        for i, param_group in enumerate(optimizer.param_groups):
-            param_group["lr"] = lr_schedule[it]
-            if i == 0:  # only the first group is regularized
-                param_group["weight_decay"] = wd_schedule[it]
-
+        # REMOVED ADAPTIVE LEARNING RATE UPDATE
+        # Instead, keep the learning rate constant at the specified value
+        
         # move images to gpu
         clean_crops = [im.cuda(non_blocking=True) for im in clean_crops]
         corrupted_crops = [im.cuda(non_blocking=True) for im in corrupted_crops]
@@ -219,9 +216,8 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
                 r_ = recloss[torch.cat(masks_crops[2:])==1].mean() if (args.drop_only == 1) else recloss.mean()
                 loss += r_
                 
-            if plot_==True and utils.is_main_process():# and args.saveckp_freq and epoch % args.saveckp_freq == 0:
+            if plot_==True and utils.is_main_process():
                 plot_ = False
-                #validating: check the reconstructed images
                 print_out = save_recon + '/epoch_' + str(epoch).zfill(5)  + '.jpg' 
                 imagesToPrint = torch.cat([clean_crops[0][0: min(15, bz)].cpu(),  corrupted_crops[0][0: min(15, bz)].cpu(),
                                       s_recons_g[0: min(15, bz)].cpu(), masks_crops[0][0: min(15, bz)].cpu()], dim=0)
@@ -251,8 +247,7 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+        # REMOVED LEARNING RATE AND WEIGHT DECAY UPDATES
         
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -260,6 +255,8 @@ def train_one_epoch(SiT_model, data_loader, optimizer, lr_schedule, wd_schedule,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+# Rest of the code remains the same
+# (FullpiplineSiT class and main block)
 class FullpiplineSiT(nn.Module):
     def __init__(self, backbone, head_recons):
         super(FullpiplineSiT, self).__init__()
@@ -284,7 +281,6 @@ class FullpiplineSiT(nn.Module):
             output_recons_local = self.head_recons(backbone_output_local)
         
         return output_recons_global, output_recons_local
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('SiTv2', parents=[get_args_parser()])
